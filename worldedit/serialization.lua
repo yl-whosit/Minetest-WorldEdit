@@ -118,16 +118,47 @@ local function deserialize_workaround(content)
 	local nodes, err
 	if not minetest.global_exists("jit") then
 		nodes, err = minetest.deserialize(content, true)
-	elseif not content:match("^%s*return%s*{") then
+	elseif not (content:match("^local%s+_%s*=%s*{};") or content:match("^%s*return%s*{")) then
 		-- The data doesn't look like we expect it to so we can't apply the workaround.
 		-- hope for the best
 		minetest.log("warning", "WorldEdit: deserializing data but can't apply LuaJIT workaround")
 		nodes, err = minetest.deserialize(content, true)
 	else
+		local header, table_body = content:match("^(.-)return%s*{(.*)}%s*$")
+		local env = {inf = math.huge, nan = 0/0}
+		if header then
+			header = header:gsub("local%s+([%a_][%w_]*)%s*=", "%1 =")
+			local header_func, err1 = loadstring(header, "@header")
+			if not header_func then
+				minetest.log("warning", "WorldEdit: deserialize: " .. err1)
+				return
+			end
+			setfenv(header_func, env)
+			local ok, err2 = pcall(header_func)
+			if not ok then
+				minetest.log("warning", "WorldEdit: deserialize: " .. err2)
+				return
+			end
+		end
+
+		local function exec_with_header(code)
+			local func, err = loadstring(code)
+			if not func then
+				return nil, err -- TODO check for nil in the caller
+			end
+			setfenv(func, env)
+			local ok, value_or_err = pcall(func)
+			if not ok then
+				return nil, value_or_err
+			end
+			return value_or_err
+		end
+
 		-- XXX: This is a filthy hack that works surprisingly well
 		-- in LuaJIT, `minetest.deserialize` will fail due to the register limit
 		nodes = {}
-		content = content:gsub("^%s*return%s*{", "", 1):gsub("}%s*$", "", 1) -- remove the starting and ending values to leave only the node data
+
+		content = table_body
 		-- remove string contents strings while preserving their length
 		local escaped = content:gsub("\\\\", "@@"):gsub("\\\"", "@@"):gsub("(\"[^\"]*\")", function(s) return string.rep("@", #s) end)
 		local startpos, startpos1 = 1, 1
@@ -139,7 +170,7 @@ local function deserialize_workaround(content)
 				break
 			end
 			local current = content:sub(startpos1, startpos)
-			entry, err = minetest.deserialize("return " .. current, true)
+			entry, err = exec_with_header("return " .. current)
 			if not entry then
 				break
 			end
@@ -147,7 +178,7 @@ local function deserialize_workaround(content)
 			startpos, startpos1 = endpos, endpos
 		end
 		if not err then
-			entry = minetest.deserialize("return " .. content:sub(startpos1), true) -- process the last entry
+			entry = exec_with_header("return " .. content:sub(startpos1)) -- process the last entry
 			table.insert(nodes, entry)
 		end
 	end
@@ -264,4 +295,3 @@ function worldedit.deserialize(origin_pos, value)
 	end
 	return #nodes
 end
-
