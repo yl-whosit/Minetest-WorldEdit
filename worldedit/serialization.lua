@@ -114,73 +114,150 @@ function worldedit.serialize(pos1, pos2)
 	return LATEST_SERIALIZATION_HEADER .. result, count
 end
 
+
+-- Replace content strings while preserving their length
+local function replace_content_strings(content)
+	local escaped = content:gsub("\\\\", "@@"):gsub("\\\"", "@@"):gsub("(\"[^\"]*\")", function(s) return string.rep("@", #s) end)
+	return escaped
+end
+
+
+local function table_body_hack(escaped, content, startpos, node_parser)
+	-- XXX: This is a filthy hack that works surprisingly well [until it does not]
+	-- in LuaJIT, `minetest.deserialize` will fail due to the register limit
+	local nodes = {}
+
+	local startpos, startpos1 = startpos, startpos
+	local endpos
+	while true do -- go through each individual node entry (except the last)
+		startpos, endpos = escaped:find("}%s*,%s*{", startpos)
+		if not startpos then
+			break
+		end
+		local current = content:sub(startpos1, startpos)
+		local entry, err = node_parser("return " .. current)
+		if err then
+			return nil, err
+		end
+		if not entry then
+			break
+		end
+		table.insert(nodes, entry)
+		startpos, startpos1 = endpos, endpos
+	end
+
+	startpos = escaped:find("}%s*$", startpos)
+	if not startpos then
+		return nil, "Expected closing } and <eof>"
+	end
+	local final = content:sub(startpos1, startpos - 1) -- cut off the final closing "}"
+	local entry, err = node_parser("return " .. final) -- process the last entry
+	if err then
+		return nil, string.format("final: %s", err)
+	end
+	table.insert(nodes, entry)
+
+	return nodes, err
+end
+
+
+-- Try to parse the `local _ = {}; _[1] = ...` header, saving values
+-- into a table and returning it.
+local function header_hack(escaped, content)
+	-- NOTE: here we assume that the header does not contain word
+	-- "return" in variables or as code. Since strings are
+	-- escaped, we don't care about them.
+
+	-- NOTE: empty capture () captures the current string position (a number)
+	local end_header, start_table_body = escaped:match("^.-()return%s*{()")
+	if not end_header then
+		return nil, "Could not find header and table body"
+	end
+
+	local header = content:sub(1, end_header-1)
+
+	-- not sure schematics can contain these, but this env is
+	-- here for compatibility with current core.serialize()
+	local env = {inf = math.huge, nan = 0/0}
+
+	if type(header) == "string" then
+		-- make local a "global", so it's saved in the environment
+		local str_local = "local "
+		if header:sub(1, #str_local) ~= str_local then
+			return nil, "Expected header starting with `local `"
+		end
+		header = header:sub(#str_local+1)
+
+		local header_func, err1 = loadstring(header, "@header")
+		if not header_func then
+			return nil, err1
+		end
+		setfenv(header_func, env)
+		local ok, err2 = pcall(header_func)
+		if not ok then
+			return nil, err2
+		end
+	else
+		return nil, "Malformed content?"
+	end
+
+	return env, start_table_body
+end
+
+
+-- Try different loading methods depending on interpreter/file format
 local function deserialize_workaround(content)
 	local nodes, err
-	if not minetest.global_exists("jit") then
+	if minetest.global_exists("jit") then
+		if content:match("^%s*return%s*{") then
+			-- file created with old style serialize
+
+			local escaped = replace_content_strings(content)
+			local startpos = escaped:match("^%s*return%s*{()")
+
+			local core_deserialize = minetest.deserialize
+			local function exec_safe(str)
+				return core_deserialize(str, true)
+			end
+			nodes, err = table_body_hack(escaped, content, startpos, exec_safe)
+		elseif content:match("^local%s+_%s*=%s*{};") then
+			-- file with a "header" at the start
+
+			local escaped = replace_content_strings(content)
+			local env_or_nil, value = header_hack(escaped, content)
+
+			if type(env_or_nil) == "table" then
+				local env = env_or_nil
+				local start_table_body = value
+				local function exec_with_header(code)
+					local func, err = loadstring(code)
+					if not func then
+						return nil, err
+					end
+					setfenv(func, env)
+					local ok, value_or_err = pcall(func)
+					if not ok then
+						return nil, value_or_err
+					end
+					return value_or_err
+				end
+
+				nodes, err = table_body_hack(escaped, content, start_table_body, exec_with_header)
+			else
+				err = value
+			end
+		else
+			-- The data doesn't look like we expect it to so we can't apply the workaround.
+			err = "can't recognize file format"
+		end
+		if not nodes then
+			minetest.log("warning", string.format("WorldEdit: deserializing data but can't apply LuaJIT workaround: %s", err or ""))
+		end
+	end
+
+	-- fallback to default deserialize if previous attempts produced nothing
+	if not nodes then
 		nodes, err = minetest.deserialize(content, true)
-	elseif not (content:match("^local%s+_%s*=%s*{};") or content:match("^%s*return%s*{")) then
-		-- The data doesn't look like we expect it to so we can't apply the workaround.
-		-- hope for the best
-		minetest.log("warning", "WorldEdit: deserializing data but can't apply LuaJIT workaround")
-		nodes, err = minetest.deserialize(content, true)
-	else
-		local header, table_body = content:match("^(.-)return%s*{(.*)}%s*$")
-		local env = {inf = math.huge, nan = 0/0}
-		if header then
-			header = header:gsub("local%s+([%a_][%w_]*)%s*=", "%1 =")
-			local header_func, err1 = loadstring(header, "@header")
-			if not header_func then
-				minetest.log("warning", "WorldEdit: deserialize: " .. err1)
-				return
-			end
-			setfenv(header_func, env)
-			local ok, err2 = pcall(header_func)
-			if not ok then
-				minetest.log("warning", "WorldEdit: deserialize: " .. err2)
-				return
-			end
-		end
-
-		local function exec_with_header(code)
-			local func, err = loadstring(code)
-			if not func then
-				return nil, err -- TODO check for nil in the caller
-			end
-			setfenv(func, env)
-			local ok, value_or_err = pcall(func)
-			if not ok then
-				return nil, value_or_err
-			end
-			return value_or_err
-		end
-
-		-- XXX: This is a filthy hack that works surprisingly well
-		-- in LuaJIT, `minetest.deserialize` will fail due to the register limit
-		nodes = {}
-
-		content = table_body
-		-- remove string contents strings while preserving their length
-		local escaped = content:gsub("\\\\", "@@"):gsub("\\\"", "@@"):gsub("(\"[^\"]*\")", function(s) return string.rep("@", #s) end)
-		local startpos, startpos1 = 1, 1
-		local endpos
-		local entry
-		while true do -- go through each individual node entry (except the last)
-			startpos, endpos = escaped:find("}%s*,%s*{", startpos)
-			if not startpos then
-				break
-			end
-			local current = content:sub(startpos1, startpos)
-			entry, err = exec_with_header("return " .. current)
-			if not entry then
-				break
-			end
-			table.insert(nodes, entry)
-			startpos, startpos1 = endpos, endpos
-		end
-		if not err then
-			entry = exec_with_header("return " .. content:sub(startpos1)) -- process the last entry
-			table.insert(nodes, entry)
-		end
 	end
 	if err then
 		minetest.log("warning", "WorldEdit: deserialize: " .. err)
