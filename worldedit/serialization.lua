@@ -118,6 +118,7 @@ end
 -- Replace content strings while preserving their length
 local function replace_content_strings(content)
 	local escaped = content:gsub("\\\\", "@@"):gsub("\\\"", "@@"):gsub("(\"[^\"]*\")", function(s) return string.rep("@", #s) end)
+	assert(#content == #escaped)
 	return escaped
 end
 
@@ -164,7 +165,7 @@ end
 -- Try to parse the `local _ = {}; _[1] = ...` header, saving values
 -- into a table and returning it.
 local function header_hack(escaped, content)
-	-- NOTE: here we assume that the header does not contain word
+	-- NOTE: here we assume that the header does not contain the word
 	-- "return" in variables or as code. Since strings are
 	-- escaped, we don't care about them.
 
@@ -204,30 +205,32 @@ local function header_hack(escaped, content)
 	return env, start_table_body
 end
 
+local core_deserialize = minetest.deserialize
+local function wrap_deserialize(code)
+	-- safe=true will strip any functions
+	return core_deserialize(code, true)
+end
 
 -- Try different loading methods depending on interpreter/file format
-local function deserialize_workaround(content)
+local function deserialize_with_workaround(content)
 	local nodes, err
 	if minetest.global_exists("jit") then
+		-- NOTE: We need this workaround specificially on LuaJIT because
+		-- it has a limit of 65535 constants per function body.
 		if content:match("^%s*return%s*{") then
 			-- file created with old style serialize
 
 			local escaped = replace_content_strings(content)
 			local startpos = escaped:match("^%s*return%s*{()")
 
-			local core_deserialize = minetest.deserialize
-			local function exec_safe(str)
-				return core_deserialize(str, true)
-			end
-			nodes, err = table_body_hack(escaped, content, startpos, exec_safe)
+			nodes, err = table_body_hack(escaped, content, startpos, wrap_deserialize)
 		elseif content:match("^local%s+_%s*=%s*{};") then
 			-- file with a "header" at the start
 
 			local escaped = replace_content_strings(content)
-			local env_or_nil, value = header_hack(escaped, content)
+			local env, value = header_hack(escaped, content)
 
-			if type(env_or_nil) == "table" then
-				local env = env_or_nil
+			if env ~= nil then
 				local start_table_body = value
 				local function exec_with_header(code)
 					local func, err = loadstring(code)
@@ -247,8 +250,8 @@ local function deserialize_workaround(content)
 				err = value
 			end
 		else
-			-- The data doesn't look like we expect it to so we can't apply the workaround.
-			err = "can't recognize file format"
+			-- the data doesn't look like we expect it to so we can't apply the workaround
+			err = "can't recognize format"
 		end
 		if not nodes then
 			minetest.log("warning", string.format("WorldEdit: deserializing data but can't apply LuaJIT workaround: %s", err or ""))
@@ -257,7 +260,7 @@ local function deserialize_workaround(content)
 
 	-- fallback to default deserialize if previous attempts produced nothing
 	if not nodes then
-		nodes, err = minetest.deserialize(content, true)
+		nodes, err = wrap_deserialize(content)
 	end
 	if err then
 		minetest.log("warning", "WorldEdit: deserialize: " .. err)
@@ -309,7 +312,7 @@ local function load_schematic(value)
 			})
 		end
 	elseif version == 4 or version == 5 then -- Nested table format
-		nodes = deserialize_workaround(content)
+		nodes = deserialize_with_workaround(content)
 	else
 		return nil
 	end
